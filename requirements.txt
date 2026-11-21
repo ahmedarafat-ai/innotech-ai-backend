@@ -1,4 +1,4 @@
-fastapi
+--extra-index-url https://download.pytorch.org/whl/cpufastapi
 uvicorn
 pydantic
 python-multipart
