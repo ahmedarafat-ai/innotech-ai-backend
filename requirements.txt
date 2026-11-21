@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+pydantic
+python-multipart
+pillow
+opencv-python-headless
+numpy
+pandas
+gdown
+requests
+tensorflow-cpu
+torch
+torchvision
+torchxrayvision
+scikit-image
+groq
