@@ -1,17 +1,24 @@
-import io
 import os
+os.environ["TORCH_COMPILE_DISABLE"] = "1"
+os.environ["TORCHDYNAMO_DISABLE"] = "1"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
+import torch
+import torchvision
+import torchvision.transforms as transforms
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras.applications.resnet50 import preprocess_input
+
+import io
 import uuid
 import base64
 import cv2
 import gdown
-import torch
 import numpy as np
 import pandas as pd
-import tensorflow as tf
 import torchxrayvision as xrv
-import torchvision.transforms as transforms
-from tensorflow import keras
-from tensorflow.keras.applications.resnet50 import preprocess_input
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -32,23 +39,51 @@ app.add_middleware(
 MODEL_PATH = "ResNet50_merged_fixed.keras"
 RAG_CSV_PATH = "rag_data.csv"
 
-if not os.path.exists(MODEL_PATH):
-    gdown.download(id="1dShO6i6sJ3rA-f8UcqB13zyI09Fp9bmp", output=MODEL_PATH, quiet=False)
+# Global cached instances (Lazy Loaded)
+_keras_model = None
+_base_grad_model = None
+_head_layers = None
+_seg_model = None
+_rag_df = None
+seg_device = "cpu"
 
-if not os.path.exists(RAG_CSV_PATH):
-    gdown.download(id="1s-EgmCDZoVYD3r3_DGGhCpXnHYntmbcq", output=RAG_CSV_PATH, quiet=False)
 
-model = keras.models.load_model(MODEL_PATH)
-resnet_backbone = model.layers[0] if isinstance(model.layers[0], keras.Model) else model
-head_layers = model.layers[1:] if resnet_backbone != model else []
-target_conv_layer = resnet_backbone.get_layer("conv4_block6_out")
+def get_classification_models():
+    global _keras_model, _base_grad_model, _head_layers
+    if _keras_model is None:
+        if not os.path.exists(MODEL_PATH):
+            gdown.download(id="1dShO6i6sJ3rA-f8UcqB13zyI09Fp9bmp", output=MODEL_PATH, quiet=False)
+        _keras_model = keras.models.load_model(MODEL_PATH)
+        resnet_backbone = _keras_model.layers[0] if isinstance(_keras_model.layers[0], keras.Model) else _keras_model
+        _head_layers = _keras_model.layers[1:] if resnet_backbone != _keras_model else []
+        target_conv_layer = resnet_backbone.get_layer("conv4_block6_out")
+        _base_grad_model = keras.Model(
+            inputs=resnet_backbone.inputs,
+            outputs=[target_conv_layer.output, resnet_backbone.output]
+        )
+    return _base_grad_model, _head_layers
 
-base_grad_model = keras.Model(
-    inputs=resnet_backbone.inputs,
-    outputs=[target_conv_layer.output, resnet_backbone.output]
-)
+
+def get_segmentation_model():
+    global _seg_model
+    if _seg_model is None:
+        _seg_model = xrv.baseline_models.chestx_det.PSPNet().to(seg_device).eval()
+    return _seg_model
+
+
+def get_rag_dataframe():
+    global _rag_df
+    if _rag_df is None:
+        if not os.path.exists(RAG_CSV_PATH):
+            gdown.download(id="1s-EgmCDZoVYD3r3_DGGhCpXnHYntmbcq", output=RAG_CSV_PATH, quiet=False)
+        df = pd.read_csv(RAG_CSV_PATH).dropna(subset=["text"]).copy()
+        df["text"] = df["text"].astype(str).str.strip()
+        _rag_df = df[df["text"] != ""].drop_duplicates(subset="text").reset_index(drop=True)
+    return _rag_df
+
 
 def compute_gradcam(img_tensor):
+    base_grad_model, head_layers = get_classification_models()
     img_tf = tf.convert_to_tensor(img_tensor, dtype=tf.float32)
     with tf.GradientTape() as tape:
         tape.watch(img_tf)
@@ -73,10 +108,9 @@ def compute_gradcam(img_tensor):
         heatmap /= max_val
     return heatmap.numpy(), float(score.numpy())
 
-seg_device = "cpu"
-seg_model = xrv.baseline_models.chestx_det.PSPNet().to(seg_device).eval()
 
 def compute_lung_segmentation(pil_img_rgb):
+    seg_model = get_segmentation_model()
     gray_img = np.array(pil_img_rgb.convert("L"), dtype=np.float32)
     img_norm = xrv.datasets.normalize(gray_img, 255)[None, ...]
     transform = transforms.Compose([xrv.datasets.XRayResizer(512)])
@@ -107,11 +141,9 @@ def compute_lung_segmentation(pil_img_rgb):
 
     return mask_b64, overlay_b64
 
-df = pd.read_csv(RAG_CSV_PATH).dropna(subset=["text"]).copy()
-df["text"] = df["text"].astype(str).str.strip()
-rag_df = df[df["text"] != ""].drop_duplicates(subset="text").reset_index(drop=True)
 
 def retrieve_reports(query: str, k: int = 3):
+    rag_df = get_rag_dataframe()
     q_words = set(query.lower().split())
     if not q_words:
         return []
@@ -131,9 +163,13 @@ def retrieve_reports(query: str, k: int = 3):
         })
     return results
 
-groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
 
 def generate_rag_answer(question: str):
+    api_key = os.environ.get("GROQ_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY is not configured on the server.")
+
+    groq_client = Groq(api_key=api_key)
     sources = retrieve_reports(question, k=3)
     context = "\n\n".join(s["snippet"] for s in sources) if sources else "No specific matching report found."
 
@@ -158,19 +194,24 @@ Retrieved Radiology Context:
     )
     return completion.choices[0].message.content, sources
 
+
 chat_history_store = []
+
 
 @app.get("/")
 def root():
     return {"status": "online", "service": "InnoTech AI Backend", "docs": "/docs"}
 
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+
 class LoginData(BaseModel):
     email: str
     password: str
+
 
 def handle_login(data: LoginData):
     if data.email == "doctor@hospital.com" and data.password == "123456":
@@ -183,13 +224,16 @@ def handle_login(data: LoginData):
         }
     raise HTTPException(status_code=401, detail="Invalid email or password")
 
+
 @app.post("/login")
 def login(data: LoginData):
     return handle_login(data)
 
+
 @app.post("/api/v1/auth/login")
 def api_login(data: LoginData):
     return handle_login(data)
+
 
 @app.post("/predict")
 def predict_xray(file: UploadFile = File(...)):
@@ -232,9 +276,11 @@ def predict_xray(file: UploadFile = File(...)):
         "disclaimer": "AI visual decision-support output only. Not a definitive clinical diagnosis."
     }
 
+
 class ChatRequest(BaseModel):
     question: Optional[str] = None
     message: Optional[str] = None
+
 
 def process_chat(data: ChatRequest):
     user_query = (data.message or data.question or "").strip()
@@ -253,13 +299,16 @@ def process_chat(data: ChatRequest):
         "sources": sources
     }
 
+
 @app.post("/chat")
 def medical_chat(data: ChatRequest):
     return process_chat(data)
 
+
 @app.post("/api/v1/ai/chat/messages")
 def mobile_medical_chat(data: ChatRequest):
     return process_chat(data)
+
 
 @app.get("/chat/history")
 def get_chat_history():
