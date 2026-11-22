@@ -1,21 +1,11 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-torchvision
-tensorflow-cpu==2.21.0
-numpy
-pandas
-pillow
-opencv-python-headless
-scikit-image
 fastapi
 uvicorn
 pydantic
 python-multipart
-torchxrayvision
+httpx
+openai
+numpy
 faiss-cpu
-sentence-transformers
+fastembed
 langchain-core
 langchain-community
-langchain-text-splitters
-langchain-huggingface
-openai
