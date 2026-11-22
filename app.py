@@ -6,7 +6,8 @@
 #
 # Railway Variables:
 #   GROQ_API_KEY     (required)
-#   LLM_MODEL        (optional, default llama-3.1-8b-instant)
+#   LLM_MODEL        (optional, default openai/gpt-oss-120b)
+#   MAX_TOKENS       (optional, default 1500)
 #   FAISS_INDEX_DIR  (optional, default ./faiss_index) - folder with index.faiss + index.pkl
 #   PREDICT_URL      (optional) - public URL of the Colab/ngrok X-ray server; if set,
 #                    /predict forwards the uploaded image there.
@@ -32,7 +33,8 @@ app.add_middleware(
 
 FAISS_INDEX_DIR = os.getenv("FAISS_INDEX_DIR", "./faiss_index")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.1-8b-instant")
+LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "1500"))
 PREDICT_URL = os.getenv("PREDICT_URL", "").rstrip("/")
 
 # ---------------------------------------------------------------------------
@@ -90,16 +92,24 @@ def generate_rag_answer(question: str):
     docs = retriever.invoke(question) if retriever is not None else []
     context = "\n\n".join(d.page_content for d in docs) if docs else "No specific matching report found."
 
+    kwargs = {}
+    if "gpt-oss" in LLM_MODEL:
+        # reasoning model: keep thinking short so it doesn't eat the token budget
+        kwargs["extra_body"] = {"reasoning_effort": "low"}
+
     completion = llm_client.chat.completions.create(
         model=LLM_MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT.format(context=context)},
             {"role": "user", "content": question},
         ],
-        max_tokens=400,
+        max_tokens=MAX_TOKENS,
         temperature=0,
+        **kwargs,
     )
     answer = (completion.choices[0].message.content or "").strip()
+    if not answer:
+        raise RuntimeError("The model returned an empty answer; try again or raise MAX_TOKENS.")
     sources = [{"uid": d.metadata.get("uid", "N/A"), "snippet": d.page_content} for d in docs]
     return answer, sources
 
