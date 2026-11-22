@@ -79,6 +79,7 @@ Rules:
 - If the user asks general educational questions about lung screening (e.g., LDCT criteria, symptoms, follow-up guidelines), provide accurate, concise clinical guidance without prescribing medications or dosages.
 - Never issue a definitive medical diagnosis; always remind that findings require physician review.
 - Respond in the same language as the user's question (English or Arabic).
+- Answer in plain text without Markdown formatting (no bold **, no # headings, no Markdown tables). Use short paragraphs or simple numbered lines.
 
 Retrieved Radiology Context:
 {context}"""
