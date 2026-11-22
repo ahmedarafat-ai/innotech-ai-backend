@@ -1,32 +1,36 @@
-import os
-os.environ["TORCH_COMPILE_DISABLE"] = "1"
-os.environ["TORCHDYNAMO_DISABLE"] = "1"
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-
-import torch
-import torchvision
-import torchvision.transforms as transforms
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras.applications.resnet50 import preprocess_input
-
 import io
+import os
 import uuid
 import base64
 import cv2
-import gdown
 import numpy as np
 import pandas as pd
-import torchxrayvision as xrv
+import tensorflow as tf
+
+tf.config.set_visible_devices([], "GPU")
+
+import torch
+import torchvision.transforms as transforms
+from tensorflow import keras
+from tensorflow.keras.applications.resnet50 import preprocess_input
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 from PIL import Image
-from groq import Groq
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from openai import OpenAI
 
-app = FastAPI(title="InnoTech AI Backend", version="3.0.0")
+try:
+    import torchxrayvision as xrv
+except Exception as e:
+    xrv = None
+    print(f"[startup] torchxrayvision import skipped: {e}")
+
+app = FastAPI(title="InnoTech AI Backend", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,54 +40,66 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODEL_PATH = "ResNet50_merged_fixed.keras"
-RAG_CSV_PATH = "rag_data.csv"
+# ---------------------------------------------------------------------------
+# 1. Env-var-driven paths (works in Colab AND on Railway)
+# ---------------------------------------------------------------------------
+IN_COLAB = os.path.exists("/content/drive")
 
-# Global cached instances (Lazy Loaded)
-_keras_model = None
-_base_grad_model = None
-_head_layers = None
-_seg_model = None
-_rag_df = None
-seg_device = "cpu"
+MODEL_PATH = os.getenv(
+    "MODEL_PATH",
+    "/content/drive/MyDrive/InnoTech_Dataset/ResNet50_merged_fixed.keras" if IN_COLAB
+    else "./ResNet50_merged_fixed.keras",
+)
+if IN_COLAB and not os.path.exists(MODEL_PATH):
+    MODEL_PATH = "/content/drive/MyDrive/InnoTech_Dataset/Models_CNN/ResNet50_merged_fixed.keras"
 
+RAG_CSV_PATH = os.getenv(
+    "RAG_CSV_PATH",
+    "/content/drive/MyDrive/InnoTech_Dataset/RAG/rag_data.csv" if IN_COLAB
+    else "./rag_data.csv",
+)
+if IN_COLAB and not os.path.exists(RAG_CSV_PATH):
+    RAG_CSV_PATH = "/content/drive/MyDrive/InnoTech_Dataset/rag_data.csv"
 
-def get_classification_models():
-    global _keras_model, _base_grad_model, _head_layers
-    if _keras_model is None:
-        if not os.path.exists(MODEL_PATH):
-            gdown.download(id="1dShO6i6sJ3rA-f8UcqB13zyI09Fp9bmp", output=MODEL_PATH, quiet=False)
-        _keras_model = keras.models.load_model(MODEL_PATH)
-        resnet_backbone = _keras_model.layers[0] if isinstance(_keras_model.layers[0], keras.Model) else _keras_model
-        _head_layers = _keras_model.layers[1:] if resnet_backbone != _keras_model else []
+FAISS_INDEX_DIR = os.getenv(
+    "FAISS_INDEX_DIR",
+    "/content/drive/MyDrive/InnoTech_Dataset/RAG/faiss_index" if IN_COLAB
+    else "./faiss_index",
+)
+
+# ---------------------------------------------------------------------------
+# 2. Startup crash-proofing: X-ray models load defensively
+# ---------------------------------------------------------------------------
+model = None
+base_grad_model = None
+head_layers = []
+
+try:
+    if os.path.exists(MODEL_PATH):
+        model = keras.models.load_model(MODEL_PATH)
+        resnet_backbone = model.layers[0] if isinstance(model.layers[0], keras.Model) else model
+        head_layers = model.layers[1:] if resnet_backbone != model else []
         target_conv_layer = resnet_backbone.get_layer("conv4_block6_out")
-        _base_grad_model = keras.Model(
+        base_grad_model = keras.Model(
             inputs=resnet_backbone.inputs,
             outputs=[target_conv_layer.output, resnet_backbone.output]
         )
-    return _base_grad_model, _head_layers
+    else:
+        print(f"[startup] MODEL_PATH not found at {MODEL_PATH}; /predict will return 503.")
+except Exception as e:
+    print(f"[startup] X-ray classifier not loaded: {e}")
 
+seg_device = "cuda" if torch.cuda.is_available() else "cpu"
+seg_model = None
 
-def get_segmentation_model():
-    global _seg_model
-    if _seg_model is None:
-        _seg_model = xrv.baseline_models.chestx_det.PSPNet().to(seg_device).eval()
-    return _seg_model
-
-
-def get_rag_dataframe():
-    global _rag_df
-    if _rag_df is None:
-        if not os.path.exists(RAG_CSV_PATH):
-            gdown.download(id="1s-EgmCDZoVYD3r3_DGGhCpXnHYntmbcq", output=RAG_CSV_PATH, quiet=False)
-        df = pd.read_csv(RAG_CSV_PATH).dropna(subset=["text"]).copy()
-        df["text"] = df["text"].astype(str).str.strip()
-        _rag_df = df[df["text"] != ""].drop_duplicates(subset="text").reset_index(drop=True)
-    return _rag_df
+try:
+    if xrv is not None:
+        seg_model = xrv.baseline_models.chestx_det.PSPNet().to(seg_device).eval()
+except Exception as e:
+    print(f"[startup] Lung segmentation model not loaded: {e}")
 
 
 def compute_gradcam(img_tensor):
-    base_grad_model, head_layers = get_classification_models()
     img_tf = tf.convert_to_tensor(img_tensor, dtype=tf.float32)
     with tf.GradientTape() as tape:
         tape.watch(img_tf)
@@ -93,11 +109,9 @@ def compute_gradcam(img_tensor):
         for layer in head_layers:
             x = layer(x)
         score = x[0][0]
-
     grads = tape.gradient(score, conv_outputs)
     if grads is None:
         return np.zeros((7, 7), dtype=np.float32), float(score.numpy())
-
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
     conv_outputs = conv_outputs[0]
     heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
@@ -110,21 +124,17 @@ def compute_gradcam(img_tensor):
 
 
 def compute_lung_segmentation(pil_img_rgb):
-    seg_model = get_segmentation_model()
     gray_img = np.array(pil_img_rgb.convert("L"), dtype=np.float32)
     img_norm = xrv.datasets.normalize(gray_img, 255)[None, ...]
     transform = transforms.Compose([xrv.datasets.XRayResizer(512)])
     img_resized = transform(img_norm)
     img_tensor = torch.from_numpy(img_resized).unsqueeze(0).to(seg_device)
-
     with torch.no_grad():
         pred = seg_model(img_tensor)
-
     left_lung_idx = seg_model.targets.index("Left Lung")
     right_lung_idx = seg_model.targets.index("Right Lung")
     lung_prob = torch.sigmoid(pred[0, left_lung_idx]) + torch.sigmoid(pred[0, right_lung_idx])
     mask_512 = (lung_prob.cpu().numpy() > 0.5).astype(np.uint8) * 255
-
     mask_224 = cv2.resize(mask_512, (224, 224), interpolation=cv2.INTER_NEAREST)
     orig_224 = np.array(pil_img_rgb.resize((224, 224)), dtype=np.uint8)
     contours, _ = cv2.findContours(mask_224, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -142,57 +152,117 @@ def compute_lung_segmentation(pil_img_rgb):
     return mask_b64, overlay_b64
 
 
-def retrieve_reports(query: str, k: int = 3):
-    rag_df = get_rag_dataframe()
-    q_words = set(query.lower().split())
-    if not q_words:
-        return []
-    scores = []
-    for idx, row in rag_df.iterrows():
-        text_lower = row["text"].lower()
-        overlap = sum(1 for w in q_words if len(w) > 2 and w in text_lower)
-        if overlap > 0:
-            scores.append((overlap, idx))
-    scores.sort(reverse=True)
-    results = []
-    for _, idx in scores[:k]:
-        row = rag_df.iloc[idx]
-        results.append({
-            "uid": str(row["uid"]) if "uid" in rag_df.columns else "N/A",
-            "snippet": row["text"][:500]
-        })
-    return results
+# ---------------------------------------------------------------------------
+# 3. RAG: embeddings + FAISS (crash-proofed: retriever=None if unavailable)
+# ---------------------------------------------------------------------------
+embedding_model = None
+try:
+    embedding_model = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True, "batch_size": 32}
+    )
+except Exception as e:
+    print(f"[startup] Embedding model not loaded: {e}")
 
+vector_store = None
+try:
+    if embedding_model is not None:
+        if os.path.exists(FAISS_INDEX_DIR):
+            vector_store = FAISS.load_local(
+                FAISS_INDEX_DIR,
+                embedding_model,
+                allow_dangerous_deserialization=True
+            )
+        elif os.path.exists(RAG_CSV_PATH):
+            df = pd.read_csv(RAG_CSV_PATH)
+            df = df.dropna(subset=["text"]).copy()
+            df["text"] = df["text"].astype(str).str.strip()
+            df = df[df["text"] != ""].copy()
+            rag_df = df.drop_duplicates(subset="text").copy()
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+            chunks = []
+            for _, row in rag_df.iterrows():
+                report_text = str(row["text"]).strip()
+                uid_val = str(row["uid"]) if "uid" in rag_df.columns else "N/A"
+                if report_text:
+                    report_chunks = text_splitter.create_documents(
+                        [report_text],
+                        metadatas=[{"uid": uid_val}]
+                    )
+                    chunks.extend(report_chunks)
+            if chunks:
+                vector_store = FAISS.from_documents(chunks, embedding_model)
+                try:
+                    vector_store.save_local(FAISS_INDEX_DIR)
+                except Exception:
+                    pass
+        else:
+            print(
+                f"[startup] No FAISS index at {FAISS_INDEX_DIR} and no CSV at {RAG_CSV_PATH}; "
+                "/chat will answer without retrieved report context."
+            )
+except Exception as e:
+    print(f"[startup] Vector store not loaded: {e}")
 
-def generate_rag_answer(question: str):
-    api_key = os.environ.get("GROQ_API_KEY", "").strip()
-    if not api_key:
-        raise HTTPException(status_code=500, detail="GROQ_API_KEY is not configured on the server.")
+retriever = (
+    vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+    if vector_store is not None else None
+)
 
-    groq_client = Groq(api_key=api_key)
-    sources = retrieve_reports(question, k=3)
-    context = "\n\n".join(s["snippet"] for s in sources) if sources else "No specific matching report found."
+# ---------------------------------------------------------------------------
+# 4. Hosted LLM (Groq, OpenAI-compatible)
+# ---------------------------------------------------------------------------
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.1-8b-instant")
+llm_client = None
 
-    system_prompt = f"""You are an AI clinical assistant for chest radiology and lung screening (such as LDCT eligibility and general pulmonary health).
+if GROQ_API_KEY:
+    llm_client = OpenAI(
+        api_key=GROQ_API_KEY,
+        base_url="https://api.groq.com/openai/v1",
+    )
+
+rag_prompt = ChatPromptTemplate.from_messages([
+    ("system", """You are an AI clinical assistant for chest radiology and lung screening (such as LDCT eligibility and general pulmonary health).
 Rules:
 - If the user asks about specific radiology findings, rely strictly on the provided report context below.
 - If the user asks general educational questions about lung screening (e.g., LDCT criteria, symptoms, follow-up guidelines), provide accurate, concise clinical guidance without prescribing medications or dosages.
 - Never issue a definitive medical diagnosis; always remind that findings require physician review.
 - Respond in the same language as the user's question (English or Arabic).
-
 Retrieved Radiology Context:
-{context}"""
+{context}"""),
+    ("human", "{question}")
+])
 
-    completion = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": question}
-        ],
-        temperature=0.2,
-        max_tokens=300
+
+def generate_rag_answer(question: str):
+    if llm_client is None:
+        raise RuntimeError(
+            "LLM is not configured: set the GROQ_API_KEY environment variable "
+            "(Railway -> your service -> Variables) and redeploy."
+        )
+    retrieved_docs = retriever.invoke(question) if retriever is not None else []
+    context = (
+        "\n\n".join(doc.page_content for doc in retrieved_docs)
+        if retrieved_docs else "No specific matching report found."
     )
-    return completion.choices[0].message.content, sources
+    messages = rag_prompt.format_messages(context=context, question=question)
+    completion = llm_client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": messages[0].content},
+            {"role": "user", "content": messages[1].content},
+        ],
+        max_tokens=250,
+        temperature=0,
+    )
+    answer = completion.choices[0].message.content.strip()
+    sources = [
+        {"uid": doc.metadata.get("uid", "N/A"), "snippet": doc.page_content}
+        for doc in retrieved_docs
+    ]
+    return answer, sources
 
 
 chat_history_store = []
@@ -237,9 +307,10 @@ def api_login(data: LoginData):
 
 @app.post("/predict")
 def predict_xray(file: UploadFile = File(...)):
+    if model is None or base_grad_model is None or seg_model is None:
+        raise HTTPException(status_code=503, detail="X-ray models are not loaded on this server.")
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Uploaded file must be an image (PNG/JPG).")
-
     try:
         image_bytes = file.file.read()
         raw_pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -248,12 +319,14 @@ def predict_xray(file: UploadFile = File(...)):
 
     pil_img = raw_pil.resize((224, 224))
     raw_img_array = np.array(pil_img, dtype=np.float32)
-
     img_for_model = np.expand_dims(raw_img_array.copy(), axis=0)
     img_preprocessed = preprocess_input(img_for_model)
 
     heatmap, score = compute_gradcam(img_preprocessed)
-    visual_finding = "Abnormal Opacity / Attention Detected" if score >= 0.5 else "Unremarkable / Clear Lung Fields"
+    visual_finding = (
+        "Abnormal Opacity / Attention Detected"
+        if score >= 0.5 else "Unremarkable / Clear Lung Fields"
+    )
 
     heatmap_resized = cv2.resize(heatmap, (224, 224))
     heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
@@ -286,10 +359,17 @@ def process_chat(data: ChatRequest):
     user_query = (data.message or data.question or "").strip()
     if not user_query:
         raise HTTPException(status_code=422, detail="Either 'message' or 'question' is required.")
+    try:
+        answer, sources = generate_rag_answer(user_query)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[/chat] generate_rag_answer failed: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=503, detail=f"Chat backend error: {type(e).__name__}: {e}")
 
-    answer, sources = generate_rag_answer(user_query)
     chat_history_store.append({"sender": "doctor", "message": user_query})
     chat_history_store.append({"sender": "ai", "message": answer})
+
     return {
         "status": "success",
         "question": user_query,
