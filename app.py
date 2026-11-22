@@ -259,6 +259,7 @@ def mobile_medical_chat(data: ChatRequest):
     return process_chat(data)
 
 
+# trigger railway build
 @app.get("/chat/history")
 def get_chat_history():
     return {"status": "success", "history": chat_history_store}
