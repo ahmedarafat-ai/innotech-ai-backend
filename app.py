@@ -13,6 +13,7 @@
 #                    /predict forwards the uploaded image there.
 
 import os
+import re
 import uuid
 from typing import Optional, List
 
@@ -21,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
-app = FastAPI(title="InnoTech AI Backend", version="3.2.0-lean")
+app = FastAPI(title="InnoTech AI Backend", version="3.3.0-lean")
 
 app.add_middleware(
     CORSMiddleware,
@@ -85,6 +86,46 @@ Retrieved Radiology Context:
 {context}"""
 
 
+_TABLE_SEP = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
+
+
+def strip_markdown(text: str) -> str:
+    """Turn Markdown into clean plain text for the Android app."""
+    lines = text.split("\n")
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        is_row = line.strip().startswith("|") and line.strip().endswith("|")
+        if is_row:
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            if _TABLE_SEP.match(nxt):        # header row of a table -> skip it and its separator
+                i += 2
+                continue
+            if _TABLE_SEP.match(line):
+                i += 1
+                continue
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            cells = [c for c in cells if c]
+            if len(cells) == 2:
+                out.append(f"- {cells[0]}: {cells[1]}")
+            elif cells:
+                out.append("- " + " | ".join(cells))
+            i += 1
+            continue
+        out.append(line)
+        i += 1
+
+    t = "\n".join(out)
+    t = re.sub(r"^\s{0,3}#{1,6}\s*", "", t, flags=re.MULTILINE)   # headings
+    t = re.sub(r"\*\*(.+?)\*\*", r"\1", t)                       # bold
+    t = re.sub(r"__(.+?)__", r"\1", t)
+    t = re.sub(r"^\s*\*\s+", "- ", t, flags=re.MULTILINE)           # * bullets -> -
+    t = re.sub(r"`([^`]+)`", r"\1", t)                              # inline code
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
 def generate_rag_answer(question: str):
     if llm_client is None:
         raise RuntimeError(
@@ -108,7 +149,7 @@ def generate_rag_answer(question: str):
         temperature=0,
         **kwargs,
     )
-    answer = (completion.choices[0].message.content or "").strip()
+    answer = strip_markdown((completion.choices[0].message.content or "").strip())
     if not answer:
         raise RuntimeError("The model returned an empty answer; try again or raise MAX_TOKENS.")
     sources = [{"uid": d.metadata.get("uid", "N/A"), "snippet": d.page_content} for d in docs]
